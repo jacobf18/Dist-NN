@@ -7,3 +7,4 @@ MMD/
 *.pickle
 figures/
 data/
+*.csv
