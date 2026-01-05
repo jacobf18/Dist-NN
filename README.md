@@ -1,4 +1,4 @@
-# Dist-NN
+# Distributional Matrix Completion via Nearest Neighbors in the Wasserstein Space
 
 Authors: Jacob Feitelberg, Kyuseong Choi, Anish Agarwal, Raaz Dwivedi
 
