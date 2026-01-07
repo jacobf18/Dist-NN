@@ -8,3 +8,4 @@ MMD/
 figures/
 data/
 *.csv
+**/*.egg-info
