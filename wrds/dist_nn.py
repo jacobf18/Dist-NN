@@ -187,7 +187,7 @@ def get_dist(ticker, year, quarter, cutoff_date, quarterly_actual, quarterly_dat
     Returns:
         dict: Dictionary mapping (ticker, year, quarter) or (year, quarter) to Wasserstein distance
     """
-    from download_data import get_rows_cols
+    from .download_data import get_rows_cols
     
     rows, _ = get_rows_cols(user_user, tickers=tickers)
     data = quarterly_data.get((ticker, year, quarter))
@@ -359,7 +359,7 @@ def get_similar_tickers(ticker, year, quarter, cutoff_date, quarterly_actual, qu
     Returns:
         dict: Dictionary mapping ticker to distance vector
     """
-    from download_data import get_rows_cols
+    from .download_data import get_rows_cols
     
     rows, cols = get_rows_cols(user_user, tickers=tickers)
     current_row = (year, quarter)
@@ -463,7 +463,7 @@ def test_train_wasserstein(test_cell, cutoff_date, quarterly_data, quarterly_act
     """
     ticker, year, quarter = test_cell
     
-    from download_data import get_rows_cols
+    from .download_data import get_rows_cols
     # Get tickers from quarterly_data keys
     all_tickers = list(set([k[0] for k in quarterly_data.keys() if k[0] is not None]))
     _, cols = get_rows_cols(user_user, tickers=all_tickers)
@@ -581,4 +581,372 @@ def test_train_wasserstein(test_cell, cutoff_date, quarterly_data, quarterly_act
             continue
     
     return output
+
+
+def get_earnings_time(cell, quarterly_actual):
+    """
+    Get the earnings announcement datetime for a given cell.
+    
+    Args:
+        cell (tuple): (ticker, year, quarter)
+        quarterly_actual (dict): Dictionary of actual values
+        
+    Returns:
+        pd.Timestamp: Earnings announcement datetime, or None if not available
+    """
+    actual = quarterly_actual.get(cell)
+    if actual is None:
+        return None
+    _, actual_date, actual_time = actual
+    return pd.to_datetime(f'{actual_date} {actual_time}', format='%Y-%m-%d %H:%M:%S')
+
+
+def get_doubly_robust_estimate(user_user_neighbor_fns, item_item_neighbor_fns, cross_neighbor_fns):
+    """
+    Compute doubly-robust estimate combining user-user, item-item, and cross terms.
+    
+    Args:
+        user_user_neighbor_fns (dict): Dictionary mapping cells to quantile functions (user-user neighbors)
+        item_item_neighbor_fns (dict): Dictionary mapping cells to quantile functions (item-item neighbors)
+        cross_neighbor_fns (dict): Dictionary mapping (cell1, cell2) tuples to quantile functions (cross terms)
+    
+    Returns:
+        float: Expected value of the doubly-robust estimate
+    """
+    sample_fns = []
+    for cell1, user_fn in user_user_neighbor_fns.items():
+        for cell2, item_fn in item_item_neighbor_fns.items():
+            cross_fn = cross_neighbor_fns.get((cell1, cell2))
+            if cross_fn is None:
+                continue
+            sample_fns.append(linear_combination([user_fn, item_fn, cross_fn], [1.0, 1.0, -1.0]))
+    # Note: The doubly-robust estimator may not remain a quantile function due to the negative part
+    if len(sample_fns) == 0:
+        return None
+    return expectation(barycenter(sample_fns))
+
+
+def get_empirical_quantile_functions(train_cells, train_cells_avg_dists_user_user, 
+                                    train_cells_avg_dists_item_item, quarterly_data):
+    """
+    Calculate empirical quantile functions for user-user, item-item, and cross neighbors.
+    
+    Args:
+        train_cells (list): List of training cells (ticker, year, quarter)
+        train_cells_avg_dists_user_user (dict): Average distances for user-user mode
+        train_cells_avg_dists_item_item (dict): Average distances for item-item mode
+        quarterly_data (dict): Dictionary of forecast data
+        
+    Returns:
+        tuple: (user_user_fns, item_item_fns, cross_fns) dictionaries
+    """
+    user_user_fns = defaultdict(dict)
+    item_item_fns = defaultdict(dict)
+    cross_fns = defaultdict(dict)
+    
+    for cell in train_cells:
+        avg_dist_dict_user_user = train_cells_avg_dists_user_user[cell]
+        avg_dist_dict_item_item = train_cells_avg_dists_item_item[cell]
+        
+        for c in avg_dist_dict_user_user.keys():
+            user_user_fns[cell][c] = empirical_quantile_function(
+                np.sort(quarterly_data[c[0], c[1], c[2]]['value'].values)
+            )
+        for c in avg_dist_dict_item_item.keys():
+            item_item_fns[cell][c] = empirical_quantile_function(
+                np.sort(quarterly_data[c[0], c[1], c[2]]['value'].values)
+            )
+        for c1 in avg_dist_dict_user_user.keys():
+            for c2 in avg_dist_dict_item_item.keys():
+                data = quarterly_data.get((c1[0], c2[1], c2[2]))
+                if data is None:
+                    continue
+                cross_fns[cell][(c1, c2)] = empirical_quantile_function(np.sort(data['value'].values))
+                
+    return user_user_fns, item_item_fns, cross_fns
+
+
+def optimize_eta_doubly_robust(average_dates, average_tickers, train_cells, quarterly_data, 
+                               quarterly_actual, cutoff_date=None, verbose=False):
+    """
+    Optimize both user-user and item-item thresholds simultaneously for doubly-robust estimator.
+    
+    Args:
+        average_dates (list): List of (year, quarter) tuples for user-user averaging
+        average_tickers (list): List of ticker symbols for item-item averaging
+        train_cells (list): List of training cells (ticker, year, quarter)
+        quarterly_data (dict): Dictionary of forecast data
+        quarterly_actual (dict): Dictionary of actual values
+        cutoff_date (pd.Timestamp, optional): Cutoff date for filtering data
+        verbose (bool): Whether to print optimization progress
+        
+    Returns:
+        tuple: (eta_user_user, eta_item_item) optimal thresholds
+    """
+    if cutoff_date is None:
+        # Use a default cutoff date if not provided
+        from datetime import datetime
+        cutoff_date = pd.Timestamp(datetime(2020, 1, 1))
+    
+    if verbose:
+        print('Calculating average distances...')
+    train_cells_avg_dists_user_user = get_avg_dist_trains(
+        train_cells, cutoff_date, average_dates, quarterly_actual, quarterly_data, user_user=True
+    )
+    train_cells_avg_dists_item_item = get_avg_dist_trains(
+        train_cells, cutoff_date, average_tickers, quarterly_actual, quarterly_data, user_user=False
+    )
+    
+    if verbose:
+        print('Calculate empirical quantile functions...')
+    # Calculate the empirical quantile functions for each possible neighbor
+    user_user_fns, item_item_fns, cross_fns = get_empirical_quantile_functions(
+        train_cells, 
+        train_cells_avg_dists_user_user, 
+        train_cells_avg_dists_item_item, 
+        quarterly_data
+    )
+    
+    def obj(params):
+        eta_user_user = params['eta_user_user']
+        eta_item_item = params['eta_item_item']
+        total_error = 0
+        
+        for cell in train_cells:
+            # Get user-user neighbors
+            neighbors_user_user = [
+                c for c, dist in train_cells_avg_dists_user_user[cell].items() 
+                if dist <= eta_user_user
+            ]
+            user_user_neighbor_fns = {c: user_user_fns[cell][c] for c in neighbors_user_user}
+            
+            # Get item-item neighbors
+            neighbors_item_item = [
+                c for c, dist in train_cells_avg_dists_item_item[cell].items() 
+                if dist <= eta_item_item
+            ]
+            item_item_neighbor_fns = {c: item_item_fns[cell][c] for c in neighbors_item_item}
+            
+            # Calculate doubly-robust estimate
+            neighbor_expectation = get_doubly_robust_estimate(
+                user_user_neighbor_fns, item_item_neighbor_fns, cross_fns[cell]
+            )
+            if neighbor_expectation is None:
+                total_error += 1000
+                continue
+                
+            # Get actual EPS value
+            eps = quarterly_actual[cell][0]
+            # Calculate error (relative error)
+            total_error += np.abs((neighbor_expectation - eps) / eps)
+            
+        return total_error / len(train_cells)
+    
+    if verbose:
+        print("Optimizing thresholds...")
+    # Optimize the objective function
+    best_eta = fmin(
+        fn=obj, 
+        verbose=verbose, 
+        space={
+            'eta_user_user': hp.loguniform('eta_user_user', -5, 1),
+            'eta_item_item': hp.loguniform('eta_item_item', -5, 1)
+        }, 
+        algo=tpe.suggest, 
+        max_evals=20
+    )
+    
+    return best_eta['eta_user_user'], best_eta['eta_item_item']
+
+
+def train_test_cell(test_cell, quarterly_data, quarterly_actual, cutoff_date=None, verbose=False):
+    """
+    Train and test doubly-robust estimator on a single test cell.
+    
+    Args:
+        test_cell (tuple): (ticker, year, quarter) for test cell
+        quarterly_data (dict): Dictionary of forecast data
+        quarterly_actual (dict): Dictionary of actual values
+        cutoff_date (pd.Timestamp, optional): Cutoff date for filtering data. 
+                                             If None, uses a default date before the test quarter.
+        verbose (bool): Whether to show progress
+        
+    Returns:
+        tuple: (test_error, baseline_error) relative errors
+    """
+    ticker, year, quarter = test_cell
+    
+    if cutoff_date is None:
+        # Use a default cutoff date (2 months before the quarter starts)
+        if quarter == 1:
+            cutoff_date = pd.Timestamp(f'{year-1}-11-01')
+        elif quarter == 2:
+            cutoff_date = pd.Timestamp(f'{year}-02-01')
+        elif quarter == 3:
+            cutoff_date = pd.Timestamp(f'{year}-05-01')
+        else:  # quarter == 4
+            cutoff_date = pd.Timestamp(f'{year}-08-01')
+    
+    # Previous 8 quarters for averaging
+    dates_average = []
+    current_date = (year, quarter)
+    for _ in range(8):
+        dates_average.append(current_date)
+        if current_date[1] == 1:
+            current_date = (current_date[0] - 1, 4)
+        else:
+            current_date = (current_date[0], current_date[1] - 1)
+    
+    if verbose:
+        print('Calculating similar tickers...')
+    # Get top 20 similar tickers
+    distance_vectors = get_similar_tickers(
+        ticker, year, quarter, cutoff_date, quarterly_actual, quarterly_data, 
+        user_user=False, verbose=verbose
+    )
+    cur_vec = distance_vectors[ticker]
+    similarity = []
+    for t, vec in distance_vectors.items():
+        similarity.append((t, np.nanmean((vec - cur_vec) ** 2)))
+    similarity.sort(key=lambda x: x[1])
+    similar_tickers = [t for t, _ in similarity[:20]]
+    
+    # Train cells (previous 4 quarters)
+    train_cells = [(ticker, y, q) for y, q in dates_average[:4]]
+        
+    if verbose:
+        print('Optimizing the doubly-robust estimator...')
+    # Optimize the doubly-robust estimator
+    eta_user, eta_item = optimize_eta_doubly_robust(
+        dates_average, similar_tickers, train_cells, quarterly_data, quarterly_actual,
+        cutoff_date=cutoff_date, verbose=verbose
+    )
+    
+    if verbose:
+        print('Calculating the doubly-robust estimate...')
+    
+    # Get the doubly-robust estimate for the test cell
+    avg_dists_user_user = get_avg_dist_trains(
+        [test_cell], cutoff_date, dates_average + [(year, quarter)], 
+        quarterly_actual, quarterly_data, user_user=True
+    )
+    avg_dists_item_item = get_avg_dist_trains(
+        [test_cell], cutoff_date, similar_tickers, 
+        quarterly_actual, quarterly_data, user_user=False
+    )
+    
+    user_user_fns, item_item_fns, cross_fns = get_empirical_quantile_functions(
+        [test_cell], avg_dists_user_user, avg_dists_item_item, quarterly_data
+    )
+    
+    # Get user-user neighbors
+    neighbors_user_user = [
+        c for c, dist in avg_dists_user_user[test_cell].items() if dist <= eta_user
+    ]
+    user_user_neighbor_fns = {c: user_user_fns[test_cell][c] for c in neighbors_user_user}
+
+    # Get item-item neighbors
+    neighbors_item_item = [
+        c for c, dist in avg_dists_item_item[test_cell].items() if dist <= eta_item
+    ]
+    item_item_neighbor_fns = {c: item_item_fns[test_cell][c] for c in neighbors_item_item}
+
+    neighbor_expectation = get_doubly_robust_estimate(
+        user_user_neighbor_fns, item_item_neighbor_fns, cross_fns[test_cell]
+    )
+    
+    if neighbor_expectation is None:
+        raise Exception("Could not compute doubly-robust estimate")
+    
+    if verbose:
+        print('Calculating relative errors...')
+    eps_actual = quarterly_actual[test_cell][0]
+    test_error = relative_error(neighbor_expectation, eps_actual)
+    baseline_error = relative_error(quarterly_data[test_cell]['value'].mean(), eps_actual)
+    
+    return test_error, baseline_error
+
+
+def evaluate_eta_test(eta, ticker, year, quarter, train_cols, test_cols, 
+                       quarterly_actual, quarterly_data, quarterly_means, 
+                       cutoff_date=None, user_user=False):
+    """
+    Evaluate a given eta threshold on test columns.
+    
+    Args:
+        eta (float): Distance threshold
+        ticker (str): Ticker symbol
+        year (int): Year
+        quarter (int): Quarter
+        train_cols (list): Training columns (quarters or tickers depending on user_user)
+        test_cols (list): Test columns
+        quarterly_actual (dict): Dictionary of actual values
+        quarterly_data (dict): Dictionary of forecast data (or quarterly_means)
+        quarterly_means (dict): Dictionary of mean forecasts (used for item-item mode)
+        cutoff_date (pd.Timestamp, optional): Cutoff date for filtering data
+        user_user (bool): If True, use user-user mode. If False, use item-item mode.
+        
+    Returns:
+        float: Average relative error on test columns
+    """
+    if cutoff_date is None:
+        cutoff_date = pd.Timestamp('2020-01-01')
+    
+    total_error = 0
+    count = 0
+    
+    for test_col in test_cols:
+        if user_user:
+            test_cell = (ticker, test_col[0], test_col[1])
+        else:
+            test_cell = (ticker, year, quarter)
+            # For item-item mode, test_col is actually a ticker
+            if isinstance(test_col, str):
+                # This is for the item-item case where we're testing on different tickers
+                continue
+        
+        if quarterly_actual.get(test_cell) is None:
+            continue
+        
+        # Get average distances
+        if user_user:
+            avg_dists = get_avg_dist_trains(
+                [test_cell], cutoff_date, train_cols, quarterly_actual, quarterly_data, user_user=True
+            )
+        else:
+            # For item-item mode, use quarterly_means
+            avg_dists = get_avg_dist_trains(
+                [test_cell], cutoff_date, train_cols, quarterly_actual, quarterly_means, user_user=False
+            )
+        
+        avg_dist_dict = avg_dists.get(test_cell, {})
+        neighbors = [c for c, dist in avg_dist_dict.items() if dist <= eta and c != test_cell]
+        
+        if len(neighbors) == 0:
+            # Use baseline (mean of available data)
+            if user_user:
+                actual_eps = quarterly_actual[test_cell][0]
+                baseline_est = quarterly_data[test_cell]['value'].mean()
+            else:
+                actual_eps = quarterly_actual[test_cell][0]
+                baseline_est = quarterly_means[test_cell]['value']
+            total_error += relative_error(baseline_est, actual_eps)
+        else:
+            # Compute barycenter
+            sample_fns = []
+            for c in neighbors:
+                if user_user:
+                    sample = quarterly_data[c]
+                else:
+                    sample = quarterly_means[c]
+                sample_fns.append(empirical_quantile_function(np.sort(sample['value'].values)))
+            
+            b_fn = barycenter(sample_fns)
+            est_mean = expectation(b_fn)
+            actual_eps = quarterly_actual[test_cell][0]
+            total_error += relative_error(est_mean, actual_eps)
+        
+        count += 1
+    
+    return total_error / count if count > 0 else float('inf')
 

@@ -133,12 +133,92 @@ The processed data is organized as:
 
 - **`quarterly_means`**: Dictionary mapping `(ticker, year, quarter)` to mean forecast value
 
+## Additional Modules
+
+### `evaluation.py`
+
+This module provides functions for evaluating Dist-NN using different windowing strategies:
+
+- **`rolling_window_evaluation()`**: Evaluate using a rolling window of fixed size
+- **`growing_window_evaluation()`**: Evaluate using a growing window (all previous quarters)
+- **`seasonal_window_evaluation()`**: Evaluate using seasonal windows (same quarter, different years)
+
+### `experiments.py`
+
+This module provides functions for running various experiments:
+
+- **`run_doubly_robust_experiment()`**: Run doubly-robust estimator experiments on multiple tickers and dates
+- **`run_item_item_evaluation()`**: Run item-item mode evaluation on a set of tickers
+- **`run_user_user_evaluation()`**: Run user-user mode evaluation on a set of tickers
+- **`calculate_avg_estimators()`**: Calculate average number of estimators per ticker
+
+### Extended `dist_nn.py` Functions
+
+Additional functions added for doubly-robust estimation and evaluation:
+
+- **`get_earnings_time()`**: Get earnings announcement datetime for a cell
+- **`get_doubly_robust_estimate()`**: Compute doubly-robust estimate combining user-user, item-item, and cross terms
+- **`get_empirical_quantile_functions()`**: Calculate empirical quantile functions for doubly-robust estimation
+- **`optimize_eta_doubly_robust()`**: Optimize both user-user and item-item thresholds simultaneously
+- **`train_test_cell()`**: Train and test doubly-robust estimator on a single test cell
+- **`evaluate_eta_test()`**: Evaluate a given eta threshold on test columns
+
+## Example Usage
+
+See `example_experiments.py` for complete examples of running experiments.
+
+### Running Doubly-Robust Experiments
+
+```python
+from wrds import load_quarterly_data, run_doubly_robust_experiment
+
+quarterly_data, quarterly_actual, quarterly_means = load_quarterly_data()
+tickers = ['AAPL', 'MSFT', 'GOOG']
+dates = [(2020, 1), (2020, 2), (2021, 1), (2021, 2)]
+
+results = run_doubly_robust_experiment(
+    tickers=tickers,
+    dates=dates,
+    quarterly_data=quarterly_data,
+    quarterly_actual=quarterly_actual,
+    output_file='doubly_robust_errors.csv'
+)
+```
+
+### Running Window Evaluations
+
+```python
+from wrds import rolling_window_evaluation, seasonal_window_evaluation
+
+# Rolling window
+results = rolling_window_evaluation(
+    tickers=tickers,
+    quarterly_data=quarterly_data,
+    quarterly_actual=quarterly_actual,
+    quarterly_means=quarterly_means,
+    window_size=10,
+    output_file='rolling_window_10.csv'
+)
+
+# Seasonal window
+results = seasonal_window_evaluation(
+    tickers=tickers,
+    quarterly_data=quarterly_data,
+    quarterly_actual=quarterly_actual,
+    quarterly_means=quarterly_means,
+    train_years=[2020, 2021, 2022, 2023],
+    test_year=2024,
+    output_file='seasonal_test.csv'
+)
+```
+
 ## Notes
 
 - The date alignment uses AAPL as the base ticker since it has complete data (20 quarters)
 - The method filters data based on cutoff dates to avoid look-ahead bias
 - Hyperparameter optimization uses Bayesian optimization (hyperopt) to find optimal distance thresholds
 - The algorithm supports both "user-user" (same quarter, different tickers) and "item-item" (same ticker, different quarters) modes
+- The doubly-robust estimator combines user-user and item-item predictions to potentially improve accuracy
 
 ## References
 
